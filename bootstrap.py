@@ -5,7 +5,11 @@ One-command environment bootstrapper:
   - Python (checks/reports; you're already running it)
   - Node.js LTS (via nvm)
   - Java 17 + apktool
-  - APK align+sign toolchain (Google apksig.jar + SignApk wrapper + debug keystore)
+  - APK align+sign toolchain:
+      * Google apksig.jar + SignApk wrapper + debug keystore (custom, full control)
+      * uber-apk-signer.jar (simpler one-step zipalign+v1/v2/v3, no custom code needed)
+  - download_apk.py — fetch a real APK by package name via APKPure's CDN subdomain,
+    which is NOT behind Cloudflare (unlike apkpure.com / apkmirror.com main sites)
 
 Usage (one line, on any fresh Linux/macOS box or Replit shell):
   curl -fsSL https://raw.githubusercontent.com/<user>/fastscripts/main/bootstrap.py | python3 -
@@ -31,6 +35,72 @@ APKSIG_URL = (
     f"{APKSIG_VERSION}/apksig-{APKSIG_VERSION}.jar"
 )
 NVM_INSTALL_URL = "https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh"
+UBER_SIGNER_VERSION = "1.3.0"
+UBER_SIGNER_URL = (
+    "https://github.com/patrickfav/uber-apk-signer/releases/download/"
+    f"v{UBER_SIGNER_VERSION}/uber-apk-signer-{UBER_SIGNER_VERSION}.jar"
+)
+
+DOWNLOAD_APK_PY = r'''#!/usr/bin/env python3
+"""
+download_apk.py — fetch a real APK by package name.
+
+apkpure.com and www.apkmirror.com are both behind a Cloudflare JS challenge on
+many networks/datacenter IPs and cannot be scraped with plain curl/requests.
+APKPure's direct CDN download subdomain (d.apkpure.com) is NOT behind that
+challenge and serves the raw APK bytes directly.
+
+Usage:
+  python3 download_apk.py <package.name> [output.apk] [--version-code N]
+
+Examples:
+  python3 download_apk.py com.google.android.youtube
+  python3 download_apk.py bin.mt.plus mt_manager.apk
+  python3 download_apk.py com.google.android.youtube --version-code 1234567890
+"""
+import sys
+import urllib.request
+
+MOBILE_UA = (
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+)
+
+
+def download(package, out_path, version_code=None):
+    version_part = f"?versionCode={version_code}" if version_code else "?version=latest"
+    url = f"https://d.apkpure.com/b/APK/{package}{version_part}"
+    print(f"Fetching {url} ...")
+    req = urllib.request.Request(url, headers={"User-Agent": MOBILE_UA})
+    with urllib.request.urlopen(req, timeout=120) as resp, open(out_path, "wb") as f:
+        f.write(resp.read())
+
+    with open(out_path, "rb") as f:
+        header = f.read(4)
+    # A real APK is a ZIP, so it starts with "PK\x03\x04". If we got HTML back
+    # (e.g. a wrong versionCode guess or a block page), header won't match.
+    if header[:2] != b"PK":
+        print(
+            f"WARNING: {out_path} does not look like a real APK (got non-ZIP content, "
+            "likely an HTML error/block page). Verify with `file` before using it."
+        )
+        return False
+    print(f"OK: saved {out_path} ({__import__('os').path.getsize(out_path)} bytes)")
+    return True
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    pkg = sys.argv[1]
+    out = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else f"{pkg}.apk"
+    vcode = None
+    if "--version-code" in sys.argv:
+        vcode = sys.argv[sys.argv.index("--version-code") + 1]
+    ok = download(pkg, out, vcode)
+    sys.exit(0 if ok else 2)
+'''
 
 SIGNAPK_JAVA = r"""import com.android.apksig.ApkSigner;
 import com.android.apksig.apk.ApkFormatException;
@@ -207,7 +277,7 @@ def ensure_apk_signing_toolchain():
     else:
         print("Debug keystore already present, skipping.")
 
-    print("\nReady. Pipeline:")
+    print("\nReady (custom signer). Pipeline:")
     print("  apktool d input.apk -o decompiled -f")
     print("  # ...edit smali...")
     print("  apktool b decompiled -o rebuilt.apk")
@@ -217,11 +287,44 @@ def ensure_apk_signing_toolchain():
     )
 
 
+def ensure_uber_apk_signer():
+    section("uber-apk-signer (simpler one-step align+sign alternative)")
+    os.makedirs(TOOLS_DIR, exist_ok=True)
+    jar_path = os.path.join(TOOLS_DIR, f"uber-apk-signer-{UBER_SIGNER_VERSION}.jar")
+    if not os.path.isfile(jar_path) or os.path.getsize(jar_path) < 1_000_000:
+        print(f"Downloading uber-apk-signer v{UBER_SIGNER_VERSION}...")
+        urllib.request.urlretrieve(UBER_SIGNER_URL, jar_path)
+    else:
+        print("uber-apk-signer already present, skipping download.")
+
+    keystore = os.path.join(TOOLS_DIR, "nova_debug.jks")
+    print("\nReady (uber-apk-signer). Usage — does zipalign + v1/v2/v3 in ONE step:")
+    print(
+        f"  java -jar {jar_path} -a rebuilt.apk \\\n"
+        f"    --ks {keystore} --ksAlias androiddebugkey \\\n"
+        f"    --ksKeyPass android --ksPass android --allowResign -o out/"
+    )
+
+
+def ensure_download_apk_script():
+    section("download_apk.py (fetch real APKs, bypassing Cloudflare)")
+    os.makedirs(TOOLS_DIR, exist_ok=True)
+    script_path = os.path.join(TOOLS_DIR, "download_apk.py")
+    with open(script_path, "w") as f:
+        f.write(DOWNLOAD_APK_PY)
+    os.chmod(script_path, 0o755)
+    print(f"Wrote {script_path}")
+    print("Usage: python3 apk-toolchain/download_apk.py <package.name> [output.apk]")
+    print("  (apkpure.com / apkmirror.com main sites are Cloudflare-gated; d.apkpure.com is not)")
+
+
 def main():
     ensure_python()
     ensure_node()
     ensure_java_and_apktool()
     ensure_apk_signing_toolchain()
+    ensure_uber_apk_signer()
+    ensure_download_apk_script()
     print("\nAll done.")
 
 
